@@ -1,0 +1,153 @@
+name: Run Sentiment Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      company_name:
+        description: "Focus company name (optional)"
+        required: false
+        default: "Aviva"
+      raw_dir:
+        description: "Absolute/relative docx folder path (optional)"
+        required: false
+        default: "articles"
+      master_json:
+        description: "Output master.json path (relative to repo)"
+        required: false
+        default: "master.json"
+
+permissions:
+  contents: write
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache Hugging Face and NLTK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/nltk_data
+          key: ${{ runner.os }}-hf-nltk-v1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Ensure tokenizer backends required by transformers model loading
+          pip install sentencepiece tiktoken
+
+      - name: Preflight diagnostics
+        env:
+          INPUT_RAW_DIR: ${{ github.event.inputs.raw_dir }}
+        run: |
+          set -euo pipefail
+          echo "Repository root:"
+          pwd
+          echo ""
+          echo "Top-level files/folders:"
+          ls -la
+          echo ""
+          echo "Configured raw_dir: ${INPUT_RAW_DIR:-<empty>}"
+          if [ -n "${INPUT_RAW_DIR:-}" ]; then
+            if [ -d "${INPUT_RAW_DIR}" ]; then
+              echo "raw_dir exists. Listing files:"
+              ls -la "${INPUT_RAW_DIR}" || true
+              echo "docx count:"
+              ls "${INPUT_RAW_DIR}"/*.docx 2>/dev/null | wc -l || true
+            else
+              echo "raw_dir does not exist."
+            fi
+          fi
+
+      - name: Run pipeline
+        env:
+          INPUT_COMPANY_NAME: ${{ github.event.inputs.company_name }}
+          INPUT_RAW_DIR: ${{ github.event.inputs.raw_dir }}
+          INPUT_MASTER_JSON: ${{ github.event.inputs.master_json }}
+        run: |
+          set -euo pipefail
+
+          MASTER_PATH="${INPUT_MASTER_JSON:-master.json}"
+          CMD=(python sentimentanalysis.py --master-json "$MASTER_PATH")
+
+          if [ -n "${INPUT_COMPANY_NAME:-}" ]; then
+            CMD+=(--company-name "$INPUT_COMPANY_NAME")
+          fi
+
+          if [ -n "${INPUT_RAW_DIR:-}" ]; then
+            if [ ! -d "${INPUT_RAW_DIR}" ]; then
+              echo "ERROR: raw_dir does not exist: ${INPUT_RAW_DIR}"
+              exit 1
+            fi
+            DOCX_COUNT=$(ls "${INPUT_RAW_DIR}"/*.docx 2>/dev/null | wc -l || true)
+            if [ "${DOCX_COUNT}" -eq 0 ]; then
+              echo "ERROR: No .docx files found in raw_dir: ${INPUT_RAW_DIR}"
+              exit 1
+            fi
+            CMD+=(--raw-dir "$INPUT_RAW_DIR")
+          fi
+
+          echo "Running: ${CMD[*]}"
+          set +e
+          "${CMD[@]}" 2>&1 | tee pipeline.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "${EXIT_CODE}" -ne 0 ]; then
+            echo "Pipeline failed with exit code ${EXIT_CODE}"
+            echo "Last 120 lines of pipeline.log:"
+            tail -n 120 pipeline.log || true
+            exit "${EXIT_CODE}"
+          fi
+
+      - name: Upload pipeline log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-log
+          path: pipeline.log
+          if-no-files-found: ignore
+
+      - name: Commit updated outputs
+        env:
+          INPUT_MASTER_JSON: ${{ github.event.inputs.master_json }}
+        run: |
+          set -euo pipefail
+
+          MASTER_PATH="${INPUT_MASTER_JSON:-master.json}"
+          git add "$MASTER_PATH" || true
+          git add figures/*.png 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No output changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "chore: refresh pipeline outputs"
+          git push
